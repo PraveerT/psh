@@ -321,12 +321,14 @@ func shellPrintGeneric(data map[string]interface{}) {
 // knownCmds are unambiguous psh commands — anything else is treated as
 // natural language and routed to Claude automatically.
 var knownCmds = map[string]bool{
+	// Unambiguous psh commands — sent directly to the phone (fast path)
+	// Natural-language-sounding words (open, type, find, etc.) are intentionally
+	// excluded so they fall through to Claude.
 	"status": true, "battery": true, "location": true, "screenshot": true,
-	"ls": true, "rm": true, "mkdir": true, "stat": true, "find": true,
+	"ls": true, "rm": true, "mkdir": true, "stat": true,
 	"pull": true, "push": true, "notifs": true, "sms": true, "apps": true,
 	"volume": true, "brightness": true, "dnd": true, "wifi": true,
-	"clipboard": true, "lock": true, "tap": true, "swipe": true,
-	"type": true, "key": true, "open": true,
+	"clipboard": true, "lock": true, "tap": true, "swipe": true, "key": true,
 }
 
 func isKnownCmd(s string) bool { return knownCmds[s] }
