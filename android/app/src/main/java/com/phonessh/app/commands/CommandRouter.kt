@@ -50,6 +50,8 @@ class CommandRouter(private val context: Context) {
         "swipe"      -> ui.swipe(cmd)
         "type"       -> ui.type(cmd)
         "key"        -> ui.key(cmd)
+        "click"      -> ui.click(cmd)
+        "ui"         -> ui.ui(cmd)
 
         else         -> resultErr(cmd.id, "unknown command: ${cmd.cmd}")
     }

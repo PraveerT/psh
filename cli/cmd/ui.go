@@ -197,6 +197,101 @@ Examples:
 	},
 }
 
+var clickCmd = &cobra.Command{
+	Use:   "click <text>",
+	Short: "Click a UI element by its visible text or description",
+	Long: `Click a UI element by matching its visible text or content description.
+More reliable than tap <x> <y> since it doesn't require coordinates.
+
+Examples:
+  psh click "Search"
+  psh click "Subscribe"
+  psh click "Send"`,
+	Args: cobra.MinimumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		text := strings.Join(args, " ")
+		c, _, err := getClient()
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+
+		result, err := c.Run(newCmd("click", []string{text}, nil))
+		if err != nil {
+			return err
+		}
+		if !result.Ok {
+			return fmt.Errorf("%s", result.Error)
+		}
+		green.Printf("clicked: %s\n", text)
+		return nil
+	},
+}
+
+var uiCmd = &cobra.Command{
+	Use:   "ui",
+	Short: "UI element inspection",
+}
+
+var uiDumpCmd = &cobra.Command{
+	Use:   "dump",
+	Short: "Dump all interactive UI elements in the current screen",
+	Long: `List all labelled and clickable UI elements on screen with their
+text, description, class, and center coordinates.
+
+Useful for finding what text to pass to 'psh click'.
+
+Example:
+  psh ui dump`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, _, err := getClient()
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+
+		result, err := c.Run(newCmd("ui", []string{"dump"}, nil))
+		if err != nil {
+			return err
+		}
+		if !result.Ok {
+			return fmt.Errorf("%s", result.Error)
+		}
+
+		elements, _ := result.Data["elements"].([]interface{})
+		for _, e := range elements {
+			m, ok := e.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			text, _ := m["text"].(string)
+			desc, _ := m["desc"].(string)
+			cx, _ := m["cx"].(float64)
+			cy, _ := m["cy"].(float64)
+			clickable, _ := m["clickable"].(bool)
+
+			label := text
+			if label == "" {
+				label = desc
+			}
+			if label == "" {
+				continue
+			}
+
+			marker := " "
+			if clickable {
+				marker = "●"
+			}
+			cyan.Printf("  %s %-50s", marker, label)
+			dim.Printf("(%d,%d)\n", int(cx), int(cy))
+		}
+		fmt.Printf("\n  %v elements\n", result.Data["count"])
+		return nil
+	},
+}
+
 func init() {
 	swipeCmd.Flags().IntVar(&swipeDuration, "duration", 300, "swipe duration in milliseconds")
+	uiCmd.AddCommand(uiDumpCmd)
 }

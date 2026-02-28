@@ -139,6 +139,77 @@ class PshAccessibilityService : AccessibilityService() {
         }
 
         /**
+         * Click a UI element by its visible text or content description.
+         * Tries ACTION_CLICK first; falls back to gesture tap on the element center.
+         */
+        fun clickByText(text: String): Pair<Boolean, String> {
+            val svc = instance ?: return Pair(false, "accessibility service not running")
+            val root = svc.rootInActiveWindow ?: return Pair(false, "no active window")
+
+            val nodes = root.findAccessibilityNodeInfosByText(text)
+            if (nodes.isNullOrEmpty()) {
+                root.recycle()
+                return Pair(false, "no element found with text: $text")
+            }
+
+            val node = nodes.first()
+            val rect = android.graphics.Rect()
+            node.getBoundsInScreen(rect)
+
+            // Try accessibility ACTION_CLICK first
+            var success = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            if (!success) {
+                // Fall back to gesture tap at element center
+                val cx = (rect.left + rect.right) / 2f
+                val cy = (rect.top + rect.bottom) / 2f
+                success = dispatchTap(cx, cy)
+            }
+
+            val label = node.text?.toString() ?: node.contentDescription?.toString() ?: text
+            nodes.forEach { it.recycle() }
+            root.recycle()
+            return Pair(success, "clicked: $label at (${rect.centerX()}, ${rect.centerY()})")
+        }
+
+        /**
+         * Dump all interactive/labelled UI elements in the current window.
+         * Returns a list of maps with text, description, class, bounds, and center.
+         */
+        fun dumpElements(): List<Map<String, Any>> {
+            val svc = instance ?: return emptyList()
+            val root = svc.rootInActiveWindow ?: return emptyList()
+            val results = mutableListOf<Map<String, Any>>()
+            collectNodes(root, results)
+            root.recycle()
+            return results
+        }
+
+        private fun collectNodes(node: AccessibilityNodeInfo, out: MutableList<Map<String, Any>>) {
+            val rect = android.graphics.Rect()
+            node.getBoundsInScreen(rect)
+            val text = node.text?.toString() ?: ""
+            val desc = node.contentDescription?.toString() ?: ""
+
+            if ((text.isNotEmpty() || desc.isNotEmpty() || node.isClickable) && rect.width() > 0) {
+                out.add(mapOf(
+                    "text"      to text,
+                    "desc"      to desc,
+                    "class"     to (node.className?.toString()?.substringAfterLast('.') ?: ""),
+                    "clickable" to node.isClickable,
+                    "cx"        to rect.centerX(),
+                    "cy"        to rect.centerY(),
+                    "bounds"    to "${rect.left},${rect.top},${rect.right},${rect.bottom}"
+                ))
+            }
+
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                collectNodes(child, out)
+                child.recycle()
+            }
+        }
+
+        /**
          * Press a navigation/hardware key.
          * Valid actions: back, home, recents, notifications
          */

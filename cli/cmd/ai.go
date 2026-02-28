@@ -23,11 +23,18 @@ IMPORTANT — AGENTIC MODE: You operate in rounds. For tasks that require seeing
 • You will then be sent the actual screenshot image
 • Round 2: Analyze the image carefully and output the precise commands
 
-When you MUST take a screenshot first (screen state unknown):
-- "open the first/top/bottom [item]"
-- "tap the [button/video/icon/link]"
-- "click on [element]"
-- Any task where coordinates depend on what's currently on screen
+PREFERRED approach for clicking UI elements:
+1. Run "psh ui dump" to get all labelled elements with their text
+2. Use "psh click <text>" to click by element text — NO coordinates needed
+3. Only use "psh tap <x> <y>" for elements with no text (images, unlabelled icons)
+
+When you need to click something with visible text/label:
+- ALWAYS prefer: psh ui dump → psh click "element text"
+- Example: to click "Subscribe" button → psh click "Subscribe"
+
+When you MUST take a screenshot (element has no text, purely visual):
+- "tap the first image/video thumbnail" (no text label)
+- Any task where the element has no visible text or description
 
 When you do NOT need a screenshot (these are deterministic):
 - "search youtube for X"    → psh open "https://www.youtube.com/results?search_query=X"
@@ -67,6 +74,8 @@ Available commands:
 - psh wifi status
 - psh clipboard get
 - psh clipboard set "<text>"
+- psh ui dump
+- psh click <text-or-description>
 - psh open <url-or-deep-link>
 - psh tap <x> <y>
 - psh swipe <x1> <y1> <x2> <y2> [--duration <ms>]

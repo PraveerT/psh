@@ -338,6 +338,7 @@ var knownCmds = map[string]bool{
 	"pull": true, "push": true, "notifs": true, "sms": true, "apps": true,
 	"volume": true, "brightness": true, "dnd": true, "wifi": true,
 	"clipboard": true, "lock": true, "tap": true, "swipe": true, "key": true,
+	"click": true, "ui": true,
 }
 
 func isKnownCmd(s string) bool { return knownCmds[s] }

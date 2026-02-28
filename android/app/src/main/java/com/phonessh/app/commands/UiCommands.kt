@@ -87,6 +87,37 @@ class UiCommands(private val context: Context) {
     }
 
     /**
+     * psh click <text>
+     * Clicks a UI element by its visible text or content description.
+     */
+    fun click(cmd: CmdMsg): String {
+        val text = cmd.args.firstOrNull()
+            ?: return resultErr(cmd.id, "usage: click <text-or-description>")
+
+        val (success, message) = PshAccessibilityService.clickByText(text)
+        return if (success) {
+            resultOk(cmd.id, mapOf("clicked" to text, "detail" to message))
+        } else {
+            resultErr(cmd.id, message)
+        }
+    }
+
+    /**
+     * psh ui dump
+     * Dumps all interactive/labelled UI elements in the current window.
+     */
+    fun ui(cmd: CmdMsg): String {
+        val sub = cmd.args.firstOrNull() ?: "dump"
+        if (sub != "dump") return resultErr(cmd.id, "usage: ui dump")
+
+        val elements = PshAccessibilityService.dumpElements()
+        return resultOk(cmd.id, mapOf(
+            "count"    to elements.size,
+            "elements" to elements
+        ))
+    }
+
+    /**
      * psh key <back|home|recents|notifications>
      * Presses a navigation/hardware key.
      */
