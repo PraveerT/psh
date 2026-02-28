@@ -384,7 +384,11 @@ func executeCommands(c *client.Client, commands []string, _ interface{}) string 
 		}
 
 		parts := parseCommand(rawCmd)
-		if len(parts) < 2 {
+		// Skip any line that isn't a psh command (e.g. Claude's explanatory text)
+		if len(parts) < 2 || parts[0] != "psh" {
+			if len(parts) > 0 {
+				dim.Printf("  %s\n", rawCmd)
+			}
 			continue
 		}
 		subCmd := parts[1]
