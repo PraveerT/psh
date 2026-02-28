@@ -116,6 +116,15 @@ Use ↑/↓ arrow keys for command history.`,
 				continue
 			}
 
+			// For gesture commands, only go direct if all args are numeric.
+			// "swipe up", "tap the button" etc. → AI
+			if (parts[0] == "tap" || parts[0] == "swipe") && !allNumeric(parts[1:]) {
+				if err := runAI(line, false); err != nil {
+					red.Printf("  ai error: %v\n", err)
+				}
+				continue
+			}
+
 			subCmd := parts[0]
 			cmdArgs := parts[1:]
 
@@ -332,6 +341,20 @@ var knownCmds = map[string]bool{
 }
 
 func isKnownCmd(s string) bool { return knownCmds[s] }
+
+func allNumeric(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	for _, a := range args {
+		for _, c := range a {
+			if c != '-' && c != '.' && (c < '0' || c > '9') {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 func shellHelp() {
 	fmt.Println()
