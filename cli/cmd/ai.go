@@ -1,11 +1,9 @@
 package cmd
 
 import (
-	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,7 +20,7 @@ const systemPrompt = `You are an AI assistant for PhoneSSH (psh) — a tool that
 
 IMPORTANT — AGENTIC MODE: You operate in rounds. For tasks that require seeing the screen:
 • Round 1: Output ONLY "psh screenshot" to capture the current screen
-• The screenshot will be sent to you as an image
+• You will then be sent the actual screenshot image
 • Round 2: Analyze the image carefully and output the precise commands
 
 When you MUST take a screenshot first (screen state unknown):
@@ -107,21 +105,9 @@ User: "send a text to +1234567890 saying I'm on my way"
 Response:
 psh sms send +1234567890 "I'm on my way"
 
-User: "search youtube for cats"
-Response:
-psh open "https://www.youtube.com/results?search_query=cats"
-
-User: "open spotify and search for lofi music"
-Response:
-psh open "spotify://search/lofi music"
-
 User: "go back"
 Response:
 psh key back
-
-User: "go to home screen"
-Response:
-psh key home
 
 Only output valid psh commands. If you cannot map the request to commands, output: # cannot map to psh commands: <reason>`
 
@@ -138,16 +124,15 @@ var aiCmd = &cobra.Command{
 Conversation context is saved between calls so Claude remembers what it
 just did. Use --clear to start a fresh conversation.
 
-For visual tasks (e.g. "tap the first video"), Claude will automatically
-take a screenshot, analyze it, and output precise tap coordinates.
+For visual tasks Claude will take a screenshot, analyze it, then tap.
 
-Requires ANTHROPIC_API_KEY env var, OR the 'claude' CLI installed.
+Requires the 'claude' CLI (claude.ai/code).
 
 Examples:
   psh ai "open youtube and search for cats"
-  psh ai "open the first video"        ← Claude remembers it opened YouTube
-  psh ai "go back"
-  psh ai --clear "start fresh"`,
+  psh ai "open the first video"
+  psh ai "scroll down"
+  psh ai --clear`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if aiClear {
 			if err := clearContext(); err != nil {
@@ -174,35 +159,16 @@ func init() {
 // ── Agentic runner ────────────────────────────────────────────────────────────
 
 func runAI(query string, noContext bool) error {
-	apiKey := anthropicKey()
-
-	// Connect to phone once, reuse for all rounds
 	c, _, err := getClient()
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-
-	if apiKey != "" {
-		return runAgenticLoop(query, apiKey, c, noContext)
-	}
-
-	// Fallback: single-pass via claude CLI (no vision, no context)
-	commands, err := askClaudeCLI(query)
-	if err != nil {
-		return fmt.Errorf("Claude error: %w", err)
-	}
-	fmt.Println()
-	executeCommands(c, commands, nil)
-	return nil
+	return runAgenticLoop(query, c, noContext)
 }
 
-// runAgenticLoop runs Claude in a multi-turn loop with optional vision and
-// persistent context. Saves user+assistant turns to disk; screenshot
-// round-trips are internal and not persisted.
-func runAgenticLoop(query, apiKey string, c *client.Client, noContext bool) error {
-	// Load saved conversation context
-	var history []claudeMsg
+func runAgenticLoop(query string, c *client.Client, noContext bool) error {
+	var history []claudeCtxMsg
 	if !noContext {
 		history, _ = loadContext()
 		if len(history) > 0 {
@@ -210,54 +176,57 @@ func runAgenticLoop(query, apiKey string, c *client.Client, noContext bool) erro
 		}
 	}
 
-	userMsg := claudeMsg{Role: "user", Content: query}
-	callMessages := append(append([]claudeMsg{}, history...), userMsg)
-
 	fmt.Println()
 
-	var finalResponse string
-	for round := 0; round < 3; round++ {
-		resp, err := callClaude(apiKey, callMessages)
-		if err != nil {
-			return fmt.Errorf("Claude API: %w", err)
-		}
-
-		commands := parseLines(resp)
-		callMessages = append(callMessages, claudeMsg{Role: "assistant", Content: resp})
-
-		screenshotB64 := executeCommands(c, commands, nil)
-
-		if screenshotB64 == "" {
-			// Final round — real commands were executed
-			finalResponse = resp
-			break
-		}
-
-		// Vision round: send image back, continue to get real commands
-		callMessages = append(callMessages, claudeMsg{
-			Role: "user",
-			Content: []contentBlock{
-				{
-					Type: "image",
-					Source: &imageSource{
-						Type:      "base64",
-						MediaType: "image/png",
-						Data:      screenshotB64,
-					},
-				},
-				{
-					Type: "text",
-					Text: "Here is the current screenshot of the phone screen. Analyze it and output the precise psh commands to complete the task.",
-				},
-			},
-		})
+	// Round 1: get initial commands (may be "psh screenshot")
+	commands, err := askClaude(history, query, "")
+	if err != nil {
+		return err
 	}
 
-	// Persist context: history + this user query + final assistant response
-	// (screenshot round-trips are stripped — only meaningful turns are saved)
+	firstResponse := strings.Join(commands, "\n")
+	screenshotB64 := executeCommands(c, commands, nil)
+
+	finalResponse := firstResponse
+
+	if screenshotB64 != "" {
+		// Decode and save screenshot to a temp file for claude --image
+		imgData, err := base64.StdEncoding.DecodeString(screenshotB64)
+		if err != nil {
+			return fmt.Errorf("decoding screenshot: %w", err)
+		}
+		tmp, err := os.CreateTemp("", "psh-screenshot-*.png")
+		if err != nil {
+			return fmt.Errorf("creating temp file: %w", err)
+		}
+		tmp.Write(imgData)
+		tmp.Close()
+		defer os.Remove(tmp.Name())
+
+		// Build history including the screenshot round so Claude has context
+		roundHistory := append(append([]claudeCtxMsg{}, history...),
+			claudeCtxMsg{Role: "user", Content: query},
+			claudeCtxMsg{Role: "assistant", Content: firstResponse},
+		)
+
+		// Round 2: pass screenshot image — Claude analyzes and outputs tap commands
+		round2 := "Here is the current screenshot of the phone screen. Analyze it and output the precise psh commands to complete the task."
+		commands2, err := askClaude(roundHistory, round2, tmp.Name())
+		if err != nil {
+			return err
+		}
+
+		finalResponse = strings.Join(commands2, "\n")
+		executeCommands(c, commands2, nil)
+	}
+
+	// Persist context: save user query + final commands (not screenshot internals)
 	if !noContext && finalResponse != "" {
-		updated := append(history, userMsg, claudeMsg{Role: "assistant", Content: finalResponse})
-		// Keep last 40 messages (~20 exchanges) to stay within token limits
+		updated := append(history,
+			claudeCtxMsg{Role: "user", Content: query},
+			claudeCtxMsg{Role: "assistant", Content: finalResponse},
+		)
+		// Keep last 40 messages (~20 exchanges)
 		if len(updated) > 40 {
 			updated = updated[len(updated)-40:]
 		}
@@ -269,8 +238,115 @@ func runAgenticLoop(query, apiKey string, c *client.Client, noContext bool) erro
 	return nil
 }
 
-// executeCommands runs a list of psh command strings. Returns the base64 PNG
-// from a screenshot command if one was executed, otherwise "".
+// ── Claude CLI ────────────────────────────────────────────────────────────────
+
+// askClaude calls `claude -p` with the full conversation history in the prompt.
+// If screenshotPath is set, passes it via --image for vision analysis.
+func askClaude(history []claudeCtxMsg, query string, screenshotPath string) ([]string, error) {
+	prompt := buildPrompt(history, query)
+
+	args := []string{"-p", prompt}
+	if screenshotPath != "" {
+		args = append(args, "--image", screenshotPath)
+	}
+
+	out, err := exec.Command("claude", args...).Output()
+	if err != nil {
+		if _, which := exec.LookPath("claude"); which != nil {
+			return nil, fmt.Errorf("'claude' CLI not found — install from claude.ai/code")
+		}
+		return nil, fmt.Errorf("running claude: %w", err)
+	}
+
+	return parseLines(strings.TrimSpace(string(out))), nil
+}
+
+// buildPrompt formats the system prompt + conversation history + new query.
+func buildPrompt(history []claudeCtxMsg, query string) string {
+	var sb strings.Builder
+	sb.WriteString(systemPrompt)
+
+	if len(history) > 0 {
+		sb.WriteString("\n\n[Conversation history]\n")
+		for _, m := range history {
+			if m.Role == "user" {
+				sb.WriteString("User: " + m.Content + "\n")
+			} else {
+				sb.WriteString("Assistant:\n" + m.Content + "\n")
+			}
+		}
+		sb.WriteString("[End of conversation history]\n")
+	}
+
+	sb.WriteString("\nUser: " + query)
+	return sb.String()
+}
+
+// ── Context persistence ───────────────────────────────────────────────────────
+
+type claudeCtxMsg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+func contextFilePath() (string, error) {
+	dir, err := client.ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "ai_context.json"), nil
+}
+
+func loadContext() ([]claudeCtxMsg, error) {
+	path, err := contextFilePath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var msgs []claudeCtxMsg
+	if err := json.Unmarshal(data, &msgs); err != nil {
+		return nil, err
+	}
+	return msgs, nil
+}
+
+func saveContext(msgs []claudeCtxMsg) error {
+	path, err := contextFilePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(msgs, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+func clearContext() error {
+	path, err := contextFilePath()
+	if err != nil {
+		return err
+	}
+	err = os.Remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+// ── Command execution ─────────────────────────────────────────────────────────
+
+// executeCommands runs parsed psh command strings against the phone.
+// Returns base64 PNG if a screenshot command was executed, otherwise "".
 func executeCommands(c *client.Client, commands []string, _ interface{}) string {
 	var screenshotB64 string
 
@@ -284,7 +360,6 @@ func executeCommands(c *client.Client, commands []string, _ interface{}) string 
 		if len(parts) < 2 {
 			continue
 		}
-		// parts[0] is "psh", parts[1] is the subcommand
 		subCmd := parts[1]
 		cmdArgs := parts[2:]
 
@@ -326,7 +401,6 @@ func executeCommands(c *client.Client, commands []string, _ interface{}) string 
 			continue
 		}
 
-		// Capture screenshot data for vision round
 		if subCmd == "screenshot" {
 			if b64, ok := result.Data["content"].(string); ok {
 				screenshotB64 = b64
@@ -341,194 +415,7 @@ func executeCommands(c *client.Client, commands []string, _ interface{}) string 
 	return screenshotB64
 }
 
-// ── Conversation context ──────────────────────────────────────────────────────
-
-// contextSavedMsg is the on-disk format — content is always a plain string
-// (images from vision rounds are never persisted).
-type contextSavedMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-func contextFilePath() (string, error) {
-	dir, err := client.ConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "ai_context.json"), nil
-}
-
-func loadContext() ([]claudeMsg, error) {
-	path, err := contextFilePath()
-	if err != nil {
-		return nil, err
-	}
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var saved []contextSavedMsg
-	if err := json.Unmarshal(data, &saved); err != nil {
-		return nil, err
-	}
-	msgs := make([]claudeMsg, len(saved))
-	for i, m := range saved {
-		msgs[i] = claudeMsg{Role: m.Role, Content: m.Content}
-	}
-	return msgs, nil
-}
-
-func saveContext(msgs []claudeMsg) error {
-	path, err := contextFilePath()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
-	saved := make([]contextSavedMsg, 0, len(msgs))
-	for _, m := range msgs {
-		content := ""
-		switch v := m.Content.(type) {
-		case string:
-			content = v
-		case []contentBlock:
-			content = "[screenshot]"
-		default:
-			content = fmt.Sprintf("%v", v)
-		}
-		saved = append(saved, contextSavedMsg{Role: m.Role, Content: content})
-	}
-	data, err := json.MarshalIndent(saved, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
-}
-
-func clearContext() error {
-	path, err := contextFilePath()
-	if err != nil {
-		return err
-	}
-	err = os.Remove(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	return err
-}
-
-// ── Anthropic API (HTTP) ──────────────────────────────────────────────────────
-
-type claudeMsg struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"` // string or []contentBlock
-}
-
-type contentBlock struct {
-	Type   string       `json:"type"`
-	Text   string       `json:"text,omitempty"`
-	Source *imageSource `json:"source,omitempty"`
-}
-
-type imageSource struct {
-	Type      string `json:"type"`
-	MediaType string `json:"media_type"`
-	Data      string `json:"data"`
-}
-
-type claudeRequest struct {
-	Model     string      `json:"model"`
-	MaxTokens int         `json:"max_tokens"`
-	System    string      `json:"system"`
-	Messages  []claudeMsg `json:"messages"`
-}
-
-type claudeResponse struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
-}
-
-func callClaude(apiKey string, messages []claudeMsg) (string, error) {
-	reqBody := claudeRequest{
-		Model:     "claude-sonnet-4-6",
-		MaxTokens: 1024,
-		System:    systemPrompt,
-		Messages:  messages,
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("content-type", "application/json")
-
-	httpClient := &http.Client{Timeout: 60 * time.Second}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var cr claudeResponse
-	if err := json.Unmarshal(data, &cr); err != nil {
-		return "", fmt.Errorf("parsing response: %w", err)
-	}
-	if cr.Error != nil {
-		return "", fmt.Errorf("API error: %s", cr.Error.Message)
-	}
-	if len(cr.Content) == 0 {
-		return "", fmt.Errorf("empty response from Claude")
-	}
-	return cr.Content[0].Text, nil
-}
-
-func anthropicKey() string {
-	if k := os.Getenv("ANTHROPIC_API_KEY"); k != "" {
-		return k
-	}
-	cfg, err := client.LoadConfig()
-	if err == nil && cfg.AnthropicKey != "" {
-		return cfg.AnthropicKey
-	}
-	return ""
-}
-
-// ── Claude CLI fallback (no vision) ──────────────────────────────────────────
-
-func askClaudeCLI(query string) ([]string, error) {
-	prompt := systemPrompt + "\n\nUser: " + query
-
-	out, err := exec.Command("claude", "-p", prompt).Output()
-	if err != nil {
-		if _, which := exec.LookPath("claude"); which != nil {
-			return nil, fmt.Errorf("no ANTHROPIC_API_KEY set and 'claude' CLI not found\n\nSet your API key:  $env:ANTHROPIC_API_KEY=\"sk-ant-...\"")
-		}
-		return nil, fmt.Errorf("running claude: %w", err)
-	}
-
-	return parseLines(strings.TrimSpace(string(out))), nil
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 func parseLines(text string) []string {
 	var out []string
@@ -540,8 +427,6 @@ func parseLines(text string) []string {
 	}
 	return out
 }
-
-// ── Helpers (unchanged) ───────────────────────────────────────────────────────
 
 func parseCommand(raw string) []string {
 	var parts []string
@@ -595,8 +480,6 @@ func printResultSummary(cmd string, data map[string]interface{}) {
 		} else {
 			fmt.Printf("  Volume set\n")
 		}
-	case "screenshot":
-		green.Println("  Screenshot saved")
 	default:
 		if errMsg, ok := data["error"]; ok {
 			red.Printf("  %v\n", errMsg)
