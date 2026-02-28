@@ -46,8 +46,11 @@ Use ↑/↓ arrow keys for command history.`,
 		}
 		defer rl.Close()
 
+		// Fresh context for every shell session
+		clearContext()
+
 		bold.Printf("\n  PhoneSSH shell — %s\n", dev.Name)
-		dim.Printf("  'help' for commands · 'exit' to quit · ↑↓ for history\n\n")
+		dim.Printf("  just type naturally · 'help' · 'exit' · ↑↓ history\n\n")
 
 		for {
 			line, err := rl.Readline()
@@ -85,21 +88,31 @@ Use ↑/↓ arrow keys for command history.`,
 			if len(parts) == 0 {
 				continue
 			}
-			// Handle "ai" locally — runs the agentic loop
+			// Strip accidental "psh" prefix
+			if parts[0] == "psh" {
+				parts = parts[1:]
+			}
+			if len(parts) == 0 {
+				continue
+			}
+
+			// "ai <query>" still works explicitly; also strip the keyword
 			if parts[0] == "ai" {
 				query := strings.Join(parts[1:], " ")
 				if query == "" {
-					red.Println("  usage: ai <natural language instruction>")
+					red.Println("  usage: ai <instruction>  (or just type naturally)")
 				} else if err := runAI(query, false); err != nil {
 					red.Printf("  ai error: %v\n", err)
 				}
 				continue
 			}
-			// Let user accidentally type "psh status" — strip the prefix
-			if parts[0] == "psh" {
-				parts = parts[1:]
-			}
-			if len(parts) == 0 {
+
+			// If the first word is NOT a known psh command, treat the whole
+			// line as a natural language instruction for Claude.
+			if !isKnownCmd(parts[0]) {
+				if err := runAI(line, false); err != nil {
+					red.Printf("  ai error: %v\n", err)
+				}
 				continue
 			}
 
@@ -305,9 +318,23 @@ func shellPrintGeneric(data map[string]interface{}) {
 	fmt.Printf("%s\n", b)
 }
 
+// knownCmds are unambiguous psh commands — anything else is treated as
+// natural language and routed to Claude automatically.
+var knownCmds = map[string]bool{
+	"status": true, "battery": true, "location": true, "screenshot": true,
+	"ls": true, "rm": true, "mkdir": true, "stat": true, "find": true,
+	"pull": true, "push": true, "notifs": true, "sms": true, "apps": true,
+	"volume": true, "brightness": true, "dnd": true, "wifi": true,
+	"clipboard": true, "lock": true, "tap": true, "swipe": true,
+	"type": true, "key": true, "open": true,
+}
+
+func isKnownCmd(s string) bool { return knownCmds[s] }
+
 func shellHelp() {
 	fmt.Println()
 	bold.Println("  Available commands:")
+	dim.Println("  (anything else is sent to Claude as natural language)")
 	fmt.Println()
 	entries := [][]string{
 		{"status", "device overview"},

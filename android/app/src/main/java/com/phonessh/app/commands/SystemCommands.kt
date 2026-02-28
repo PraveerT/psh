@@ -88,11 +88,19 @@ class SystemCommands(private val context: Context) {
                 "screenshot requires Accessibility access — in PhoneSSH app tap 'Grant Accessibility Access'")
 
         val b64 = java.util.Base64.getEncoder().encodeToString(bytes)
+
+        val wm = context.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+        val metrics = android.util.DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(metrics)
+
         return resultOk(cmd.id, mapOf(
             "filename" to "screenshot.png",
             "size" to bytes.size,
             "content" to b64,
-            "encoding" to "base64"
+            "encoding" to "base64",
+            "display_width" to metrics.widthPixels,
+            "display_height" to metrics.heightPixels
         ))
     }
 

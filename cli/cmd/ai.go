@@ -185,7 +185,7 @@ func runAgenticLoop(query string, c *client.Client, noContext bool) error {
 	}
 
 	firstResponse := strings.Join(commands, "\n")
-	screenshotB64 := executeCommands(c, commands, nil)
+	screenshotB64, screenshotDims := executeCommands(c, commands, nil)
 
 	finalResponse := firstResponse
 
@@ -209,12 +209,14 @@ func runAgenticLoop(query string, c *client.Client, noContext bool) error {
 			claudeCtxMsg{Role: "assistant", Content: firstResponse},
 		)
 
-		// Round 2: tell Claude to use the Read tool to view the screenshot file,
-		// then output the tap/swipe commands. --allowedTools Read lets claude
-		// read image files visually (Claude Code is multimodal).
+		// Round 2: tell Claude the exact screen resolution so coordinates are correct
+		dimsHint := ""
+		if screenshotDims != "" {
+			dimsHint = fmt.Sprintf("\nIMPORTANT: The phone screen is %s pixels. All tap/swipe coordinates must be in this pixel space.", screenshotDims)
+		}
 		round2 := fmt.Sprintf(
-			"A screenshot of the phone screen has been saved to: %s\n\nUse the Read tool to view it, analyze what is on screen, then output the precise psh commands to complete the task.",
-			tmp.Name(),
+			"A screenshot of the phone screen has been saved to: %s%s\n\nUse the Read tool to view it, analyze what is on screen, then output the precise psh commands to complete the task.",
+			tmp.Name(), dimsHint,
 		)
 		commands2, err := askClaudeWithRead(roundHistory, round2, filepath.Dir(tmp.Name()))
 		if err != nil {
@@ -373,9 +375,8 @@ func clearContext() error {
 // ── Command execution ─────────────────────────────────────────────────────────
 
 // executeCommands runs parsed psh command strings against the phone.
-// Returns base64 PNG if a screenshot command was executed, otherwise "".
-func executeCommands(c *client.Client, commands []string, _ interface{}) string {
-	var screenshotB64 string
+// Returns base64 PNG and display dimensions ("WxH") if a screenshot was taken.
+func executeCommands(c *client.Client, commands []string, _ interface{}) (screenshotB64, screenshotDims string) {
 
 	for _, rawCmd := range commands {
 		if strings.HasPrefix(rawCmd, "#") {
@@ -435,7 +436,14 @@ func executeCommands(c *client.Client, commands []string, _ interface{}) string 
 		if subCmd == "screenshot" {
 			if b64, ok := result.Data["content"].(string); ok {
 				screenshotB64 = b64
-				dim.Println("  screenshot captured — analyzing...")
+				w, _ := result.Data["display_width"].(float64)
+				h, _ := result.Data["display_height"].(float64)
+				if w > 0 && h > 0 {
+					screenshotDims = fmt.Sprintf("%.0fx%.0f", w, h)
+					dim.Printf("  screenshot captured (%s) — analyzing...\n", screenshotDims)
+				} else {
+					dim.Println("  screenshot captured — analyzing...")
+				}
 			}
 			continue
 		}
@@ -443,7 +451,7 @@ func executeCommands(c *client.Client, commands []string, _ interface{}) string 
 		printResultSummary(subCmd, result.Data)
 	}
 
-	return screenshotB64
+	return
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
