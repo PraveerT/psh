@@ -85,6 +85,16 @@ Use ↑/↓ arrow keys for command history.`,
 			if len(parts) == 0 {
 				continue
 			}
+			// Handle "ai" locally — runs the agentic loop
+			if parts[0] == "ai" {
+				query := strings.Join(parts[1:], " ")
+				if query == "" {
+					red.Println("  usage: ai <natural language instruction>")
+				} else if err := runAI(query, false); err != nil {
+					red.Printf("  ai error: %v\n", err)
+				}
+				continue
+			}
 			// Let user accidentally type "psh status" — strip the prefix
 			if parts[0] == "psh" {
 				parts = parts[1:]
@@ -327,6 +337,7 @@ func shellHelp() {
 		{"swipe <x1> <y1> <x2> <y2>", "swipe gesture"},
 		{"type <text>", "type into focused field"},
 		{"key <back|home|recents|notifs>", "press nav key"},
+		{"ai <instruction>", "natural language control"},
 		{"help", "show this help"},
 		{"exit", "quit shell"},
 	}
