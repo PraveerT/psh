@@ -75,6 +75,12 @@ func init() {
 	rootCmd.AddCommand(dndCmd)
 	rootCmd.AddCommand(wifiCmd)
 	rootCmd.AddCommand(clipboardCmd)
+	rootCmd.AddCommand(openCmd)
+	rootCmd.AddCommand(tapCmd)
+	rootCmd.AddCommand(swipeCmd)
+	rootCmd.AddCommand(typeCmd)
+	rootCmd.AddCommand(keyCmd)
+	rootCmd.AddCommand(aiCmd)
 }
 
 // getClient loads config and connects to the phone.

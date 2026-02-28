@@ -20,6 +20,7 @@ type Device struct {
 type Config struct {
 	Devices       []Device `json:"devices"`
 	DefaultDevice string   `json:"default_device"`
+	AnthropicKey  string   `json:"anthropic_key,omitempty"`
 }
 
 func ConfigDir() (string, error) {

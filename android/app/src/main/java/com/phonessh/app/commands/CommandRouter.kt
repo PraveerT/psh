@@ -11,6 +11,7 @@ class CommandRouter(private val context: Context) {
     private val notifs = NotifCommands(context)
     private val sms = SmsCommands(context)
     private val apps = AppCommands(context)
+    private val ui = UiCommands(context)
 
     fun dispatch(cmd: CmdMsg): String = when (cmd.cmd) {
         // ── File system ──────────────────────────────────────────────────────────
@@ -42,6 +43,13 @@ class CommandRouter(private val context: Context) {
 
         // ── Apps ─────────────────────────────────────────────────────────────────
         "apps"       -> apps.dispatch(cmd)
+
+        // ── UI / Screen interaction ───────────────────────────────────────────
+        "open"       -> ui.open(cmd)
+        "tap"        -> ui.tap(cmd)
+        "swipe"      -> ui.swipe(cmd)
+        "type"       -> ui.type(cmd)
+        "key"        -> ui.key(cmd)
 
         else         -> resultErr(cmd.id, "unknown command: ${cmd.cmd}")
     }
