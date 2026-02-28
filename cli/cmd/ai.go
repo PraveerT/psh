@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -126,10 +127,16 @@ Only output valid psh commands. If you cannot map the request to commands, outpu
 
 // ── Cobra command ─────────────────────────────────────────────────────────────
 
+var aiNoContext bool
+var aiClear bool
+
 var aiCmd = &cobra.Command{
 	Use:   "ai <natural-language-instruction>",
 	Short: "Control your phone with natural language (powered by Claude)",
 	Long: `Use natural language to control your phone via Claude AI.
+
+Conversation context is saved between calls so Claude remembers what it
+just did. Use --clear to start a fresh conversation.
 
 For visual tasks (e.g. "tap the first video"), Claude will automatically
 take a screenshot, analyze it, and output precise tap coordinates.
@@ -137,20 +144,36 @@ take a screenshot, analyze it, and output precise tap coordinates.
 Requires ANTHROPIC_API_KEY env var, OR the 'claude' CLI installed.
 
 Examples:
-  psh ai "open the first video on the screen"
-  psh ai "clear my slack notifications"
-  psh ai "search youtube for lofi music"
-  psh ai "turn on do not disturb and set volume to 20"`,
-	Args: cobra.MinimumNArgs(1),
+  psh ai "open youtube and search for cats"
+  psh ai "open the first video"        ← Claude remembers it opened YouTube
+  psh ai "go back"
+  psh ai --clear "start fresh"`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if aiClear {
+			if err := clearContext(); err != nil {
+				return err
+			}
+			green.Println("conversation context cleared")
+			if len(args) == 0 {
+				return nil
+			}
+		}
+		if len(args) == 0 {
+			return fmt.Errorf("provide a natural language instruction, or --clear to reset context")
+		}
 		query := strings.Join(args, " ")
-		return runAI(query)
+		return runAI(query, aiNoContext)
 	},
+}
+
+func init() {
+	aiCmd.Flags().BoolVar(&aiClear, "clear", false, "clear conversation context and start fresh")
+	aiCmd.Flags().BoolVar(&aiNoContext, "no-context", false, "ignore saved context for this call")
 }
 
 // ── Agentic runner ────────────────────────────────────────────────────────────
 
-func runAI(query string) error {
+func runAI(query string, noContext bool) error {
 	apiKey := anthropicKey()
 
 	// Connect to phone once, reuse for all rounds
@@ -161,10 +184,10 @@ func runAI(query string) error {
 	defer c.Close()
 
 	if apiKey != "" {
-		return runAgenticLoop(query, apiKey, c)
+		return runAgenticLoop(query, apiKey, c, noContext)
 	}
 
-	// Fallback: single-pass via claude CLI (no vision)
+	// Fallback: single-pass via claude CLI (no vision, no context)
 	commands, err := askClaudeCLI(query)
 	if err != nil {
 		return fmt.Errorf("Claude error: %w", err)
@@ -174,37 +197,44 @@ func runAI(query string) error {
 	return nil
 }
 
-// runAgenticLoop runs Claude in a multi-turn loop with optional vision.
-// Round 1: text query → commands (may include "psh screenshot")
-// Round 2: screenshot image → follow-up commands
-func runAgenticLoop(query, apiKey string, c *client.Client) error {
-	messages := []claudeMsg{
-		{Role: "user", Content: query},
+// runAgenticLoop runs Claude in a multi-turn loop with optional vision and
+// persistent context. Saves user+assistant turns to disk; screenshot
+// round-trips are internal and not persisted.
+func runAgenticLoop(query, apiKey string, c *client.Client, noContext bool) error {
+	// Load saved conversation context
+	var history []claudeMsg
+	if !noContext {
+		history, _ = loadContext()
+		if len(history) > 0 {
+			dim.Printf("  [context: %d messages]\n", len(history))
+		}
 	}
+
+	userMsg := claudeMsg{Role: "user", Content: query}
+	callMessages := append(append([]claudeMsg{}, history...), userMsg)
 
 	fmt.Println()
 
+	var finalResponse string
 	for round := 0; round < 3; round++ {
-		resp, err := callClaude(apiKey, messages)
+		resp, err := callClaude(apiKey, callMessages)
 		if err != nil {
 			return fmt.Errorf("Claude API: %w", err)
 		}
 
 		commands := parseLines(resp)
+		callMessages = append(callMessages, claudeMsg{Role: "assistant", Content: resp})
 
-		// Add assistant turn to history
-		messages = append(messages, claudeMsg{Role: "assistant", Content: resp})
-
-		// Execute commands; capture screenshot data if taken
 		screenshotB64 := executeCommands(c, commands, nil)
 
 		if screenshotB64 == "" {
-			// No screenshot taken — we're done
+			// Final round — real commands were executed
+			finalResponse = resp
 			break
 		}
 
-		// Pass the screenshot image to Claude for round 2
-		messages = append(messages, claudeMsg{
+		// Vision round: send image back, continue to get real commands
+		callMessages = append(callMessages, claudeMsg{
 			Role: "user",
 			Content: []contentBlock{
 				{
@@ -221,6 +251,19 @@ func runAgenticLoop(query, apiKey string, c *client.Client) error {
 				},
 			},
 		})
+	}
+
+	// Persist context: history + this user query + final assistant response
+	// (screenshot round-trips are stripped — only meaningful turns are saved)
+	if !noContext && finalResponse != "" {
+		updated := append(history, userMsg, claudeMsg{Role: "assistant", Content: finalResponse})
+		// Keep last 40 messages (~20 exchanges) to stay within token limits
+		if len(updated) > 40 {
+			updated = updated[len(updated)-40:]
+		}
+		if err := saveContext(updated); err != nil {
+			dim.Printf("  (context save error: %v)\n", err)
+		}
 	}
 
 	return nil
@@ -296,6 +339,86 @@ func executeCommands(c *client.Client, commands []string, _ interface{}) string 
 	}
 
 	return screenshotB64
+}
+
+// ── Conversation context ──────────────────────────────────────────────────────
+
+// contextSavedMsg is the on-disk format — content is always a plain string
+// (images from vision rounds are never persisted).
+type contextSavedMsg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+func contextFilePath() (string, error) {
+	dir, err := client.ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "ai_context.json"), nil
+}
+
+func loadContext() ([]claudeMsg, error) {
+	path, err := contextFilePath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var saved []contextSavedMsg
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return nil, err
+	}
+	msgs := make([]claudeMsg, len(saved))
+	for i, m := range saved {
+		msgs[i] = claudeMsg{Role: m.Role, Content: m.Content}
+	}
+	return msgs, nil
+}
+
+func saveContext(msgs []claudeMsg) error {
+	path, err := contextFilePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	saved := make([]contextSavedMsg, 0, len(msgs))
+	for _, m := range msgs {
+		content := ""
+		switch v := m.Content.(type) {
+		case string:
+			content = v
+		case []contentBlock:
+			content = "[screenshot]"
+		default:
+			content = fmt.Sprintf("%v", v)
+		}
+		saved = append(saved, contextSavedMsg{Role: m.Role, Content: content})
+	}
+	data, err := json.MarshalIndent(saved, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+func clearContext() error {
+	path, err := contextFilePath()
+	if err != nil {
+		return err
+	}
+	err = os.Remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 // ── Anthropic API (HTTP) ──────────────────────────────────────────────────────
