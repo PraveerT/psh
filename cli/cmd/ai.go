@@ -1,7 +1,12 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -10,9 +15,30 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// ── System prompt ─────────────────────────────────────────────────────────────
+
 const systemPrompt = `You are an AI assistant for PhoneSSH (psh) — a tool that lets users control their Android phone from the terminal.
 
-When the user gives you a natural language instruction, respond with ONLY the psh commands to run, one per line. No explanation, no markdown, no code blocks — just the raw commands.
+IMPORTANT — AGENTIC MODE: You operate in rounds. For tasks that require seeing the screen:
+• Round 1: Output ONLY "psh screenshot" to capture the current screen
+• The screenshot will be sent to you as an image
+• Round 2: Analyze the image carefully and output the precise commands
+
+When you MUST take a screenshot first (screen state unknown):
+- "open the first/top/bottom [item]"
+- "tap the [button/video/icon/link]"
+- "click on [element]"
+- Any task where coordinates depend on what's currently on screen
+
+When you do NOT need a screenshot (these are deterministic):
+- "search youtube for X"    → psh open "https://www.youtube.com/results?search_query=X"
+- "launch spotify"          → psh apps launch spotify
+- "go back"                 → psh key back
+- "go home"                 → psh key home
+- "send a text to X"        → psh sms send ...
+
+When given a screenshot: look at the actual pixel positions of UI elements and output precise coordinates.
+Typical screen widths: 1080 (most phones) or 1440 (high-res). Center x ≈ width/2.
 
 Available commands:
 - psh status
@@ -49,18 +75,32 @@ Available commands:
 - psh key <back|home|recents|notifications>
 
 Examples:
+
+User: "open the first video on the screen"
+Response (round 1 — need visual context):
+psh screenshot
+
+[Screenshot provided]
+Response (round 2 — tap based on what you see):
+psh tap 540 420
+
+User: "tap the search bar and type cats"
+Response (round 1):
+psh screenshot
+
+[Screenshot provided]
+Response (round 2):
+psh tap 540 180
+psh type "cats"
+
+User: "search youtube for cats"
+Response (no screenshot needed):
+psh open "https://www.youtube.com/results?search_query=cats"
+
 User: "clear slack notifications and turn on do not disturb"
 Response:
 psh notifs --clear slack
 psh dnd on
-
-User: "what's my battery and storage"
-Response:
-psh status
-
-User: "take a screenshot"
-Response:
-psh screenshot
 
 User: "send a text to +1234567890 saying I'm on my way"
 Response:
@@ -84,123 +124,301 @@ psh key home
 
 Only output valid psh commands. If you cannot map the request to commands, output: # cannot map to psh commands: <reason>`
 
+// ── Cobra command ─────────────────────────────────────────────────────────────
+
 var aiCmd = &cobra.Command{
 	Use:   "ai <natural-language-instruction>",
 	Short: "Control your phone with natural language (powered by Claude)",
 	Long: `Use natural language to control your phone via Claude AI.
 
-Requires the 'claude' CLI to be installed and authenticated (claude.ai/code).
+For visual tasks (e.g. "tap the first video"), Claude will automatically
+take a screenshot, analyze it, and output precise tap coordinates.
+
+Requires ANTHROPIC_API_KEY env var, OR the 'claude' CLI installed.
 
 Examples:
+  psh ai "open the first video on the screen"
   psh ai "clear my slack notifications"
-  psh ai "what's my battery level and location"
-  psh ai "turn on do not disturb and set volume to 20"
-  psh ai "take a screenshot"`,
+  psh ai "search youtube for lofi music"
+  psh ai "turn on do not disturb and set volume to 20"`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		query := strings.Join(args, " ")
-
-		commands, err := askClaude(query)
-		if err != nil {
-			return fmt.Errorf("Claude error: %w", err)
-		}
-
-		if len(commands) == 0 {
-			return fmt.Errorf("Claude returned no commands")
-		}
-
-		fmt.Println()
-
-		// Connect once and execute all commands
-		c, _, err := getClient()
-		if err != nil {
-			return err
-		}
-		defer c.Close()
-
-		for _, rawCmd := range commands {
-			if strings.HasPrefix(rawCmd, "#") {
-				dim.Printf("skip: %s\n", rawCmd)
-				continue
-			}
-
-			parts := parseCommand(rawCmd)
-			if len(parts) < 2 {
-				continue
-			}
-			// parts[0] is "psh", parts[1] is the subcommand
-			subCmd := parts[1]
-			cmdArgs := parts[2:]
-
-			flags := map[string]string{}
-			pureArgs := []string{}
-			i := 0
-			for i < len(cmdArgs) {
-				if strings.HasPrefix(cmdArgs[i], "--") {
-					key := strings.TrimPrefix(cmdArgs[i], "--")
-					if i+1 < len(cmdArgs) && !strings.HasPrefix(cmdArgs[i+1], "--") {
-						flags[key] = cmdArgs[i+1]
-						i += 2
-					} else {
-						flags[key] = "true"
-						i++
-					}
-				} else {
-					pureArgs = append(pureArgs, cmdArgs[i])
-					i++
-				}
-			}
-
-			cyan.Printf("→ %s\n", rawCmd)
-			msg := client.CmdMsg{
-				Type:  "cmd",
-				ID:    fmt.Sprintf("%d", time.Now().UnixNano()),
-				Cmd:   subCmd,
-				Args:  pureArgs,
-				Flags: flags,
-			}
-
-			result, err := c.Run(msg)
-			if err != nil {
-				red.Printf("  error: %v\n", err)
-				continue
-			}
-			if !result.Ok {
-				red.Printf("  error: %s\n", result.Error)
-				continue
-			}
-
-			printResultSummary(subCmd, result.Data)
-		}
-
-		return nil
+		return runAI(query)
 	},
 }
 
-// askClaude runs the claude CLI in print mode and returns a list of psh commands.
-func askClaude(query string) ([]string, error) {
+// ── Agentic runner ────────────────────────────────────────────────────────────
+
+func runAI(query string) error {
+	apiKey := anthropicKey()
+
+	// Connect to phone once, reuse for all rounds
+	c, _, err := getClient()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	if apiKey != "" {
+		return runAgenticLoop(query, apiKey, c)
+	}
+
+	// Fallback: single-pass via claude CLI (no vision)
+	commands, err := askClaudeCLI(query)
+	if err != nil {
+		return fmt.Errorf("Claude error: %w", err)
+	}
+	fmt.Println()
+	executeCommands(c, commands, nil)
+	return nil
+}
+
+// runAgenticLoop runs Claude in a multi-turn loop with optional vision.
+// Round 1: text query → commands (may include "psh screenshot")
+// Round 2: screenshot image → follow-up commands
+func runAgenticLoop(query, apiKey string, c *client.Client) error {
+	messages := []claudeMsg{
+		{Role: "user", Content: query},
+	}
+
+	fmt.Println()
+
+	for round := 0; round < 3; round++ {
+		resp, err := callClaude(apiKey, messages)
+		if err != nil {
+			return fmt.Errorf("Claude API: %w", err)
+		}
+
+		commands := parseLines(resp)
+
+		// Add assistant turn to history
+		messages = append(messages, claudeMsg{Role: "assistant", Content: resp})
+
+		// Execute commands; capture screenshot data if taken
+		screenshotB64 := executeCommands(c, commands, nil)
+
+		if screenshotB64 == "" {
+			// No screenshot taken — we're done
+			break
+		}
+
+		// Pass the screenshot image to Claude for round 2
+		messages = append(messages, claudeMsg{
+			Role: "user",
+			Content: []contentBlock{
+				{
+					Type: "image",
+					Source: &imageSource{
+						Type:      "base64",
+						MediaType: "image/png",
+						Data:      screenshotB64,
+					},
+				},
+				{
+					Type: "text",
+					Text: "Here is the current screenshot of the phone screen. Analyze it and output the precise psh commands to complete the task.",
+				},
+			},
+		})
+	}
+
+	return nil
+}
+
+// executeCommands runs a list of psh command strings. Returns the base64 PNG
+// from a screenshot command if one was executed, otherwise "".
+func executeCommands(c *client.Client, commands []string, _ interface{}) string {
+	var screenshotB64 string
+
+	for _, rawCmd := range commands {
+		if strings.HasPrefix(rawCmd, "#") {
+			dim.Printf("  %s\n", rawCmd)
+			continue
+		}
+
+		parts := parseCommand(rawCmd)
+		if len(parts) < 2 {
+			continue
+		}
+		// parts[0] is "psh", parts[1] is the subcommand
+		subCmd := parts[1]
+		cmdArgs := parts[2:]
+
+		flags := map[string]string{}
+		pureArgs := []string{}
+		i := 0
+		for i < len(cmdArgs) {
+			if strings.HasPrefix(cmdArgs[i], "--") {
+				key := strings.TrimPrefix(cmdArgs[i], "--")
+				if i+1 < len(cmdArgs) && !strings.HasPrefix(cmdArgs[i+1], "--") {
+					flags[key] = cmdArgs[i+1]
+					i += 2
+				} else {
+					flags[key] = "true"
+					i++
+				}
+			} else {
+				pureArgs = append(pureArgs, cmdArgs[i])
+				i++
+			}
+		}
+
+		cyan.Printf("→ %s\n", rawCmd)
+		msg := client.CmdMsg{
+			Type:  "cmd",
+			ID:    fmt.Sprintf("%d", time.Now().UnixNano()),
+			Cmd:   subCmd,
+			Args:  pureArgs,
+			Flags: flags,
+		}
+
+		result, err := c.Run(msg)
+		if err != nil {
+			red.Printf("  error: %v\n", err)
+			continue
+		}
+		if !result.Ok {
+			red.Printf("  error: %s\n", result.Error)
+			continue
+		}
+
+		// Capture screenshot data for vision round
+		if subCmd == "screenshot" {
+			if b64, ok := result.Data["content"].(string); ok {
+				screenshotB64 = b64
+				dim.Println("  screenshot captured — analyzing...")
+			}
+			continue
+		}
+
+		printResultSummary(subCmd, result.Data)
+	}
+
+	return screenshotB64
+}
+
+// ── Anthropic API (HTTP) ──────────────────────────────────────────────────────
+
+type claudeMsg struct {
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"` // string or []contentBlock
+}
+
+type contentBlock struct {
+	Type   string       `json:"type"`
+	Text   string       `json:"text,omitempty"`
+	Source *imageSource `json:"source,omitempty"`
+}
+
+type imageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+}
+
+type claudeRequest struct {
+	Model     string      `json:"model"`
+	MaxTokens int         `json:"max_tokens"`
+	System    string      `json:"system"`
+	Messages  []claudeMsg `json:"messages"`
+}
+
+type claudeResponse struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+func callClaude(apiKey string, messages []claudeMsg) (string, error) {
+	reqBody := claudeRequest{
+		Model:     "claude-sonnet-4-6",
+		MaxTokens: 1024,
+		System:    systemPrompt,
+		Messages:  messages,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("content-type", "application/json")
+
+	httpClient := &http.Client{Timeout: 60 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var cr claudeResponse
+	if err := json.Unmarshal(data, &cr); err != nil {
+		return "", fmt.Errorf("parsing response: %w", err)
+	}
+	if cr.Error != nil {
+		return "", fmt.Errorf("API error: %s", cr.Error.Message)
+	}
+	if len(cr.Content) == 0 {
+		return "", fmt.Errorf("empty response from Claude")
+	}
+	return cr.Content[0].Text, nil
+}
+
+func anthropicKey() string {
+	if k := os.Getenv("ANTHROPIC_API_KEY"); k != "" {
+		return k
+	}
+	cfg, err := client.LoadConfig()
+	if err == nil && cfg.AnthropicKey != "" {
+		return cfg.AnthropicKey
+	}
+	return ""
+}
+
+// ── Claude CLI fallback (no vision) ──────────────────────────────────────────
+
+func askClaudeCLI(query string) ([]string, error) {
 	prompt := systemPrompt + "\n\nUser: " + query
 
 	out, err := exec.Command("claude", "-p", prompt).Output()
 	if err != nil {
-		// Try to give a helpful error if claude isn't installed
 		if _, which := exec.LookPath("claude"); which != nil {
-			return nil, fmt.Errorf("'claude' CLI not found — install it from claude.ai/code")
+			return nil, fmt.Errorf("no ANTHROPIC_API_KEY set and 'claude' CLI not found\n\nSet your API key:  $env:ANTHROPIC_API_KEY=\"sk-ant-...\"")
 		}
 		return nil, fmt.Errorf("running claude: %w", err)
 	}
 
-	text := strings.TrimSpace(string(out))
-	var commands []string
+	return parseLines(strings.TrimSpace(string(out))), nil
+}
+
+func parseLines(text string) []string {
+	var out []string
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+		if line != "" {
+			out = append(out, line)
 		}
-		commands = append(commands, line)
 	}
-	return commands, nil
+	return out
 }
+
+// ── Helpers (unchanged) ───────────────────────────────────────────────────────
 
 func parseCommand(raw string) []string {
 	var parts []string
@@ -264,4 +482,3 @@ func printResultSummary(cmd string, data map[string]interface{}) {
 		}
 	}
 }
-
