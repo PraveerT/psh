@@ -75,6 +75,7 @@ func init() {
 	rootCmd.AddCommand(dndCmd)
 	rootCmd.AddCommand(wifiCmd)
 	rootCmd.AddCommand(clipboardCmd)
+	rootCmd.AddCommand(shellCmd)
 	rootCmd.AddCommand(openCmd)
 	rootCmd.AddCommand(tapCmd)
 	rootCmd.AddCommand(swipeCmd)
