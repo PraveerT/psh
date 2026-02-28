@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.PhoneSSH" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+        <item name="colorPrimary">@color/psh_blue</item>
+        <item name="colorPrimaryVariant">@color/psh_surface</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <item name="colorSecondary">@color/psh_green</item>
+        <item name="colorOnSecondary">@color/black</item>
+        <item name="android:statusBarColor">@color/psh_bg</item>
+        <item name="android:navigationBarColor">@color/psh_bg</item>
+        <item name="android:windowBackground">@color/psh_bg</item>
+    </style>
+</resources>
