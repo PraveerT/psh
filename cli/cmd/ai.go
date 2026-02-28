@@ -190,7 +190,7 @@ func runAgenticLoop(query string, c *client.Client, noContext bool) error {
 	finalResponse := firstResponse
 
 	if screenshotB64 != "" {
-		// Decode and save screenshot to a temp file for claude --image
+		// Decode and save screenshot to a temp file
 		imgData, err := base64.StdEncoding.DecodeString(screenshotB64)
 		if err != nil {
 			return fmt.Errorf("decoding screenshot: %w", err)
@@ -209,9 +209,14 @@ func runAgenticLoop(query string, c *client.Client, noContext bool) error {
 			claudeCtxMsg{Role: "assistant", Content: firstResponse},
 		)
 
-		// Round 2: pass screenshot image — Claude analyzes and outputs tap commands
-		round2 := "Here is the current screenshot of the phone screen. Analyze it and output the precise psh commands to complete the task."
-		commands2, err := askClaude(roundHistory, round2, tmp.Name())
+		// Round 2: tell Claude to use the Read tool to view the screenshot file,
+		// then output the tap/swipe commands. --allowedTools Read lets claude
+		// read image files visually (Claude Code is multimodal).
+		round2 := fmt.Sprintf(
+			"A screenshot of the phone screen has been saved to: %s\n\nUse the Read tool to view it, analyze what is on screen, then output the precise psh commands to complete the task.",
+			tmp.Name(),
+		)
+		commands2, err := askClaudeWithRead(roundHistory, round2, filepath.Dir(tmp.Name()))
 		if err != nil {
 			return err
 		}
@@ -256,6 +261,28 @@ func askClaude(history []claudeCtxMsg, query string, screenshotPath string) ([]s
 			return nil, fmt.Errorf("'claude' CLI not found — install from claude.ai/code")
 		}
 		return nil, fmt.Errorf("running claude: %w", err)
+	}
+
+	return parseLines(strings.TrimSpace(string(out))), nil
+}
+
+// askClaudeWithRead calls claude -p with the Read tool allowed so Claude can
+// open the screenshot image file and see it visually before responding.
+func askClaudeWithRead(history []claudeCtxMsg, query string, allowDir string) ([]string, error) {
+	prompt := buildPrompt(history, query)
+
+	args := []string{
+		"-p", prompt,
+		"--allowedTools", "Read",
+		"--add-dir", allowDir,
+	}
+
+	out, err := exec.Command("claude", args...).Output()
+	if err != nil {
+		if _, which := exec.LookPath("claude"); which != nil {
+			return nil, fmt.Errorf("'claude' CLI not found — install from claude.ai/code")
+		}
+		return nil, fmt.Errorf("running claude (vision): %w", err)
 	}
 
 	return parseLines(strings.TrimSpace(string(out))), nil
